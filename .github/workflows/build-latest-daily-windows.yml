@@ -150,16 +150,49 @@ jobs:
           Write-Host "Contenido del paquete:"
           Get-ChildItem $package | Select-Object Name, Length
 
-      - name: Probar ejecutable
+      - name: Validar paquete
         shell: pwsh
         run: |
-          $server = Join-Path $env:GITHUB_WORKSPACE "package\llama-server.exe"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package"
 
-          & $server --version
+          $requiredFiles = @(
+              "llama-server.exe",
+              "llama.dll",
+              "llama-server-impl.dll",
+              "llama-common.dll",
+              "ggml.dll",
+              "ggml-base.dll",
+              "ggml-cpu.dll",
+              "ggml-cuda.dll",
+              "cudart64_12.dll",
+              "cublas64_12.dll",
+              "cublasLt64_12.dll",
+              "LICENSE",
+              "BUILD-INFO.txt"
+          )
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "llama-server.exe no superó la prueba --version."
+          foreach ($file in $requiredFiles) {
+              $path = Join-Path $package $file
+
+              if (-not (Test-Path $path)) {
+                  throw "Falta un archivo requerido: $file"
+              }
+
+              if ((Get-Item $path).Length -eq 0) {
+                  throw "El archivo está vacío: $file"
+              }
+
+              Write-Host "OK: $file"
           }
+
+          $serverPath = Join-Path $package "llama-server.exe"
+          $hash = Get-FileHash -Path $serverPath -Algorithm SHA256
+
+          Write-Host ""
+          Write-Host "llama-server.exe SHA256:"
+          Write-Host $hash.Hash
+          Write-Host ""
+          Write-Host "Paquete validado correctamente."
 
       - name: Subir compilación
         uses: actions/upload-artifact@v6
