@@ -1,134 +1,100 @@
-name: Build latest TurboQuant daily tag for Windows
+name: Build latest TurboQuant daily for Windows
 
 on:
   workflow_dispatch:
     inputs:
-      source_tag:
-        description: "auto o un tag exacto, por ejemplo feature-turboquant-kv-cache-b10676-c26baf1"
-        required: true
-        default: "auto"
+      tag:
+        description: "Tag exacto de TheTom; dejar vacío para usar el último daily"
+        required: false
+        default: ""
         type: string
 
 permissions:
   contents: read
 
 jobs:
-  build-windows:
+  build-windows-cuda:
     name: Windows x64 CUDA 12.4 RTX 3060
     runs-on: windows-2022
     timeout-minutes: 120
 
     steps:
-      - name: Checkout upstream repository
+      - name: Descargar repositorio de TheTom
         uses: actions/checkout@v6
         with:
           repository: TheTom/llama-cpp-turboquant
-          ref: feature/turboquant-kv-cache
           fetch-depth: 0
-          fetch-tags: true
+          path: source
 
-      - name: Select daily tag
-        id: select_tag
+      - name: Seleccionar tag daily
+        id: version
         shell: pwsh
         env:
-          REQUESTED_TAG: ${{ inputs.source_tag }}
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          $requestedTag = $env:REQUESTED_TAG
+          Set-Location source
 
-          if (
-            [string]::IsNullOrWhiteSpace($requestedTag) -or
-            $requestedTag -eq "auto"
-          ) {
-            Write-Host "Buscando el último tag diario..."
+          git fetch --tags --force
 
-            $availableTags = @(
-              git tag `
-                --list "feature-turboquant-kv-cache-b*" `
-                --sort=-version:refname
-            )
+          if ([string]::IsNullOrWhiteSpace($env:REQUESTED_TAG)) {
+              $tags = @(
+                  git tag `
+                    --list "feature-turboquant-kv-cache-b*" `
+                    --sort=-version:refname
+              )
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "No se pudieron consultar los tags"
-            }
+              if ($tags.Count -eq 0) {
+                  throw "No se encontraron tags daily de TurboQuant."
+              }
 
-            $selectedTag = $availableTags |
-              Select-Object -First 1
+              $tag = $tags[0].Trim()
           }
           else {
-            if (
-              $requestedTag -notmatch
-              '^feature-turboquant-kv-cache-b[0-9]+-[0-9a-f]+$'
-            ) {
-              throw "Formato de tag inválido: $requestedTag"
-            }
+              $tag = $env:REQUESTED_TAG.Trim()
 
-            git rev-parse --verify "refs/tags/$requestedTag"
+              git rev-parse "refs/tags/$tag" 2>$null
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "El tag solicitado no existe: $requestedTag"
-            }
-
-            $selectedTag = $requestedTag
+              if ($LASTEXITCODE -ne 0) {
+                  throw "El tag solicitado no existe: $tag"
+              }
           }
 
-          if ([string]::IsNullOrWhiteSpace($selectedTag)) {
-            throw "No se encontró ningún tag diario de TurboQuant"
-          }
+          Write-Host "Tag seleccionado: $tag"
 
-          Write-Host "Tag seleccionado: $selectedTag"
+          git checkout --detach "refs/tags/$tag"
 
-          git checkout --detach "refs/tags/$selectedTag"
+          $commit = (git rev-parse --short HEAD).Trim()
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "No se pudo hacer checkout de $selectedTag"
-          }
-
-          $commit = git rev-parse HEAD
-
-          Write-Host "Commit seleccionado: $commit"
-
-          "tag=$selectedTag" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
           "commit=$commit" >> $env:GITHUB_OUTPUT
 
-      - name: Show selected version
-        shell: pwsh
-        run: |
-          Write-Host "Tag: ${{ steps.select_tag.outputs.tag }}"
-          Write-Host "Commit: ${{ steps.select_tag.outputs.commit }}"
-
-          git show `
-            --no-patch `
-            --format="Commit: %H%nFecha: %cI%nMensaje: %s" `
-            HEAD
-
-      - name: Install CUDA Toolkit 12.4
-        uses: ./.github/actions/windows-setup-cuda
+      - name: Instalar CUDA Toolkit 12.4
+        uses: ./source/.github/actions/windows-setup-cuda
         with:
           cuda_version: "12.4"
 
-      - name: Install Ninja
+      - name: Instalar Ninja
         shell: pwsh
         run: |
           choco install ninja -y --no-progress
 
-      - name: Configure and build llama-server
+      - name: Configurar y compilar llama-server
         shell: cmd
+        working-directory: source
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
 
           cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DCMAKE_CUDA_ARCHITECTURES=86-real ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
             -DLLAMA_BUILD_SERVER=ON ^
             -DLLAMA_BUILD_TOOLS=ON ^
             -DLLAMA_BUILD_EXAMPLES=OFF ^
             -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DGGML_BACKEND_DL=ON ^
-            -DGGML_CPU_ALL_VARIANTS=ON ^
-            -DGGML_CUDA=ON ^
-            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES=86
+            -DLLAMA_BUILD_BORINGSSL=ON
 
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
 
@@ -137,54 +103,69 @@ jobs:
             --target llama-server ^
             -j %NINJA_JOBS%
 
-      - name: Add runtime DLLs and build information
+      - name: Preparar paquete portable
         shell: pwsh
         env:
-          SOURCE_TAG: ${{ steps.select_tag.outputs.tag }}
-          SOURCE_COMMIT: ${{ steps.select_tag.outputs.commit }}
+          BUILD_TAG: ${{ steps.version.outputs.tag }}
+          BUILD_COMMIT: ${{ steps.version.outputs.commit }}
         run: |
-          $destination = Join-Path $PWD "build\bin\Release"
+          $sourceBin = Join-Path $env:GITHUB_WORKSPACE "source\build\bin\Release"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package"
 
-          if (-not (Test-Path "$destination\llama-server.exe")) {
-            throw "No se encontró llama-server.exe"
+          if (-not (Test-Path "$sourceBin\llama-server.exe")) {
+              throw "No se encontró llama-server.exe después de compilar."
           }
 
-          Copy-Item ".\LICENSE" $destination -Force
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
 
-          Copy-Item `
-            "$env:CUDA_PATH\bin\cudart64_*.dll" `
-            $destination -Force
+          Copy-Item "$sourceBin\*" $package -Recurse -Force
+          Copy-Item "$env:GITHUB_WORKSPACE\source\LICENSE" $package -Force
 
-          Copy-Item `
-            "$env:CUDA_PATH\bin\cublas64_*.dll" `
-            $destination -Force
+          $cudaPatterns = @(
+              "cudart64_*.dll",
+              "cublas64_*.dll",
+              "cublasLt64_*.dll"
+          )
 
-          Copy-Item `
-            "$env:CUDA_PATH\bin\cublasLt64_*.dll" `
-            $destination -Force
+          foreach ($pattern in $cudaPatterns) {
+              $files = Get-ChildItem `
+                  -Path "$env:CUDA_PATH\bin" `
+                  -Filter $pattern `
+                  -ErrorAction SilentlyContinue
 
-          @(
-            "Source repository: TheTom/llama-cpp-turboquant"
-            "Source tag: $env:SOURCE_TAG"
-            "Source commit: $env:SOURCE_COMMIT"
-            "CUDA: 12.4"
-            "CUDA architecture: 86"
-            "Target GPU: RTX 3060"
-            "Build date UTC: $([DateTime]::UtcNow.ToString('u'))"
-          ) | Set-Content `
-              -Path "$destination\build-info.txt" `
-              -Encoding UTF8
+              foreach ($file in $files) {
+                  Copy-Item $file.FullName $package -Force
+              }
+          }
 
-          Get-ChildItem $destination |
-            Select-Object Name, Length |
-            Sort-Object Name |
-            Format-Table -AutoSize
+          @"
+          Source: https://github.com/TheTom/llama-cpp-turboquant
+          Tag: $env:BUILD_TAG
+          Commit: $env:BUILD_COMMIT
+          CUDA: 12.4
+          Architecture: NVIDIA sm_86 / RTX 3060
+          Build date UTC: $([DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm:ss"))
+          "@ | Set-Content "$package\BUILD-INFO.txt"
 
-      - name: Upload Windows build
+          Write-Host "Contenido del paquete:"
+          Get-ChildItem $package | Select-Object Name, Length
+
+      - name: Probar ejecutable
+        shell: pwsh
+        run: |
+          $server = Join-Path $env:GITHUB_WORKSPACE "package\llama-server.exe"
+
+          & $server --version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "llama-server.exe no superó la prueba --version."
+          }
+
+      - name: Subir compilación
         uses: actions/upload-artifact@v6
         with:
-          name: turboquant-${{ steps.select_tag.outputs.tag }}-windows-x64-cuda12.4-rtx3060
-          path: build/bin/Release/
+          name: turboquant-${{ steps.version.outputs.tag }}-windows-x64-cuda12.4-sm86
+          path: package
           if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+          compression-level: 6
+          retention-days: 1
